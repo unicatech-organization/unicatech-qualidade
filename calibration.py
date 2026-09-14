@@ -23,12 +23,43 @@ from PIL import ImageGrab
 import auto_detect
 import citrix_utils
 
+try:
+    import win32clipboard
+    _HAS_CLIPBOARD = True
+except ImportError:
+    _HAS_CLIPBOARD = False
+
 CONFIG_PATH = Path(__file__).parent / "config.json"
 CAPTURE_KEY = "f8"
 CANCEL_KEY = "esc"
 
 POINT_PAD_X = 90
 POINT_PAD_Y = 16
+
+# How long to wait, after moving the mouse away from a just-captured point, before
+# taking its template screenshot -- see _settle_before_screenshot. Long enough for
+# a CSS :hover transition to finish reverting on the site.
+HOVER_SETTLE_SECONDS = 0.35
+
+# Auto-added around the exact "ponta a ponta" corner clicks for the search-result
+# calibration (see run_calibration part 2/2), so the user can click the precise
+# edges without having to eyeball a manual margin -- the code always adds a
+# consistent buffer on top of whatever exact box was clicked.
+TABLE_REGION_PAD = 15
+
+MOUSE_MOVE_SECONDS = 0.25
+
+# Deliberately longer than the runtime default (wait_after_search_seconds) --
+# this only runs once, to get the empty result on screen before the user
+# manually captures its corners in part 2/2, and there's no retry loop here to
+# fall back on if the page hasn't finished loading yet like there is at runtime.
+CALIBRATION_SEARCH_WAIT_SECONDS = 3.5
+
+# A CEP/Número combo known to return NO data, used to auto-trigger the empty
+# search needed for part 2/2 -- saves the user from having to go find/type one
+# themselves right in the middle of the wizard.
+KNOWN_EMPTY_CEP = "13420778"
+KNOWN_EMPTY_NUMERO = "9999"
 
 
 def _wait_for_capture(log):
@@ -46,6 +77,82 @@ def _wait_for_capture(log):
                 time.sleep(0.02)
             return None
         time.sleep(0.02)
+
+
+# Minimum width/height (px) for the table-result two-corner capture -- rejects an
+# accidental double-tap at the same spot (mouse not moved between the two F8
+# presses), which would otherwise silently save a zero-area region: seen in
+# practice corrupting a region to a single point and making the template
+# screenshot itself fail ("cannot write empty image").
+MIN_REGION_SIZE_PX = 10
+
+
+def _capture_two_corners(log, tl_instruction: str, br_instruction: str):
+    """Prompt for two opposite corners (top-left, then bottom-right), retrying
+    the pair if they land too close together instead of accepting a degenerate
+    region. Returns (x1, y1, x2, y2) in absolute screen coords, or None if
+    cancelled."""
+    while True:
+        log(f"\n> {tl_instruction}")
+        tl = _wait_for_capture(log)
+        if tl is None:
+            return None
+        log(f"> {br_instruction}")
+        br = _wait_for_capture(log)
+        if br is None:
+            return None
+
+        x1, y1 = min(tl.x, br.x), min(tl.y, br.y)
+        x2, y2 = max(tl.x, br.x), max(tl.y, br.y)
+        if (x2 - x1) < MIN_REGION_SIZE_PX or (y2 - y1) < MIN_REGION_SIZE_PX:
+            log(f"   Os dois cantos capturados ficaram praticamente no mesmo lugar "
+                f"({tl.x},{tl.y}) e ({br.x},{br.y}) -- parece que o mouse não foi movido entre "
+                f"um F8 e outro. Vamos tentar de novo: capture os dois cantos OPOSTOS de verdade.")
+            continue
+        return x1, y1, x2, y2
+
+
+def _set_clipboard_text(text: str):
+    win32clipboard.OpenClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardText(text, win32clipboard.CF_TEXT)
+    finally:
+        win32clipboard.CloseClipboard()
+
+
+def _fill_field_at(x, y, value: str):
+    """Click the field at this exact absolute position and fill it via clipboard
+    paste (same approach as automation._fill_field, which found typed keystrokes
+    can get duplicated by the remote app on some machines)."""
+    pyautogui.click(x, y, duration=MOUSE_MOVE_SECONDS)
+    time.sleep(0.15)
+    pyautogui.hotkey("ctrl", "a")
+    pyautogui.press("delete")
+    time.sleep(0.1)
+    if _HAS_CLIPBOARD:
+        _set_clipboard_text(value)
+        time.sleep(0.05)
+        pyautogui.hotkey("ctrl", "v")
+    else:
+        pyautogui.typewrite(value, interval=0.05)
+    time.sleep(0.15)
+
+
+def _settle_before_screenshot(log):
+    """Move the mouse off to a neutral spot (screen center -- never a corner, to
+    avoid pyautogui's FAILSAFE) and pause briefly before taking template
+    screenshots. Capturing a point (see _wait_for_capture) requires the mouse to
+    be RIGHT ON TOP of it, which for a button means it's sitting in its :hover
+    state at that exact instant -- but when auto_detect looks for that button
+    later, the mouse is normally elsewhere (it searches BEFORE moving/clicking),
+    so it's comparing against the button's NORMAL appearance. Saving the template
+    while still hovering would bake in a mismatch that lowers match confidence
+    for no real reason -- stepping away first keeps the saved appearance
+    consistent with what's actually on screen at match time."""
+    screen_w, screen_h = pyautogui.size()
+    pyautogui.moveTo(screen_w // 2, screen_h // 2, duration=0.1)
+    time.sleep(HOVER_SETTLE_SECONDS)
 
 
 def _save_template(name: str, box, log, click_ratio=None):
@@ -74,32 +181,27 @@ def run_calibration(log=print):
         "momento em que você apertar F8 (não importa qual janela está em foco agora).")
 
     config = {
-        "wait_after_search_seconds": 3.5,
+        "wait_after_search_seconds": 1.0,
         "delay_between_cnpjs_seconds": 0.7,
         "tesseract_cmd": "C:\\Program Files\\Tesseract-OCR\\tesseract.exe",
     }
 
     window_left = window_top = None
     window_title = None
-
-    steps = [
-        ("cep_field", "point", "Posicione o mouse sobre o CAMPO CEP."),
-        ("numero_field", "point", "Posicione o mouse sobre o CAMPO NÚMERO."),
-        ("pesquisar_button", "point", "Posicione o mouse sobre o BOTÃO PESQUISAR."),
-        ("row_region_tl", "point", "Posicione o mouse no CANTO SUPERIOR ESQUERDO da PRIMEIRA LINHA da tabela "
-                                    "(logo abaixo dos cabeçalhos MOVIMENTO/DATA/... — onde aparece "
-                                    "'No data available in table' quando vazio, ou o primeiro resultado). "
-                                    "Deixe uma margem folgada acima/à esquerda."),
-        ("row_region_br", "point", "Posicione o mouse no CANTO INFERIOR DIREITO dessa mesma primeira linha "
-                                    "da tabela. Deixe uma margem folgada abaixo/à direita."),
-        ("marker_tl", "point", "Posicione o mouse no CANTO SUPERIOR ESQUERDO do rótulo 'DOCUMENTO' "
-                                "(usado para detectar se a sessão deslogou)."),
-        ("marker_br", "point", "Posicione o mouse no CANTO INFERIOR DIREITO desse mesmo rótulo 'DOCUMENTO'."),
-    ]
-
     captured = {}
     captured_abs = {}
-    for i, (key, kind, instruction) in enumerate(steps):
+
+    # ---------- Parte 1/2: campos de busca ----------
+    log("\n--- PARTE 1/2: campos de busca ---")
+    log("Importante: apenas POSICIONE o mouse em cada elemento, sem clicar -- um clique "
+        "sem querer no campo CEP/Número deixa o cursor piscando ali, e isso fica registrado "
+        "no print da calibração.")
+    field_steps = [
+        ("cep_field", "Posicione o mouse sobre o CAMPO CEP (sem clicar)."),
+        ("numero_field", "Posicione o mouse sobre o CAMPO NÚMERO (sem clicar)."),
+        ("pesquisar_button", "Posicione o mouse sobre o BOTÃO PESQUISAR."),
+    ]
+    for i, (key, instruction) in enumerate(field_steps):
         log(f"\n> {instruction}")
         pos = _wait_for_capture(log)
         if pos is None:
@@ -126,19 +228,9 @@ def run_calibration(log=print):
     config["cep_field"] = {"x": captured["cep_field"][0], "y": captured["cep_field"][1]}
     config["numero_field"] = {"x": captured["numero_field"][0], "y": captured["numero_field"][1]}
     config["pesquisar_button"] = {"x": captured["pesquisar_button"][0], "y": captured["pesquisar_button"][1]}
-    config["table_row_region"] = {
-        "x1": captured["row_region_tl"][0], "y1": captured["row_region_tl"][1],
-        "x2": captured["row_region_br"][0], "y2": captured["row_region_br"][1],
-    }
-    config["app_marker_region"] = {
-        "x1": captured["marker_tl"][0], "y1": captured["marker_tl"][1],
-        "x2": captured["marker_br"][0], "y2": captured["marker_br"][1],
-    }
 
-    CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
-    log(f"\nCalibração salva em {CONFIG_PATH}")
-
-    log("\nSalvando templates de imagem (backup para tentativa de calibração automática)...")
+    log("\nSalvando templates de imagem dos campos (backup para tentativa de calibração automática)...")
+    _settle_before_screenshot(log)
     try:
         cx, cy = captured_abs["cep_field"]
         _save_template("cep_field", (cx - POINT_PAD_X, cy - POINT_PAD_Y, cx + POINT_PAD_X, cy + POINT_PAD_Y),
@@ -151,14 +243,61 @@ def run_calibration(log=print):
         bx, by = captured_abs["pesquisar_button"]
         _save_template("pesquisar_button", (bx - POINT_PAD_X, by - POINT_PAD_Y, bx + POINT_PAD_X, by + POINT_PAD_Y),
                         log, click_ratio=(0.5, 0.5))
+    except Exception as exc:
+        log(f"   Aviso: não consegui salvar todos os templates ({exc}). "
+            f"A calibração manual continua válida, só a automática pode não funcionar depois.")
 
-        rx1, ry1 = captured_abs["row_region_tl"]
-        rx2, ry2 = captured_abs["row_region_br"]
-        _save_template("table_row_region", (min(rx1, rx2), min(ry1, ry2), max(rx1, rx2), max(ry1, ry2)), log)
+    log(f"\nPreenchendo CEP {KNOWN_EMPTY_CEP} / Número {KNOWN_EMPTY_NUMERO} (combinação conhecida "
+        f"sem resultado) e clicando em Pesquisar, para já deixar a tela pronta para a Parte 2/2...")
+    try:
+        cx, cy = captured_abs["cep_field"]
+        nx, ny = captured_abs["numero_field"]
+        bx, by = captured_abs["pesquisar_button"]
+        _fill_field_at(cx, cy, KNOWN_EMPTY_CEP)
+        _fill_field_at(nx, ny, KNOWN_EMPTY_NUMERO)
+        pyautogui.click(bx, by, duration=MOUSE_MOVE_SECONDS)
+        log(f"   Busca disparada. Aguardando {CALIBRATION_SEARCH_WAIT_SECONDS}s o resultado carregar...")
+        time.sleep(CALIBRATION_SEARCH_WAIT_SECONDS)
+    except Exception as exc:
+        log(f"   Aviso: não consegui preencher/buscar automaticamente ({exc}). "
+            f"Faça essa busca manualmente antes de continuar.")
 
-        mx1, my1 = captured_abs["marker_tl"]
-        mx2, my2 = captured_abs["marker_br"]
-        _save_template("app_marker_region", (min(mx1, mx2), min(my1, my2), max(mx1, mx2), max(my1, my2)), log)
+    # ---------- Parte 2/2: resultado da pesquisa (ponta a ponta) ----------
+    log("\n--- PARTE 2/2: resultado da pesquisa ---")
+    log(f"A busca com CEP {KNOWN_EMPTY_CEP} / Número {KNOWN_EMPTY_NUMERO} já foi feita e a tela "
+        f"deve estar mostrando 'No data available in table' agora. Se por algum motivo não estiver "
+        f"vazia (ex: esse CEP passou a retornar dado), refaça manualmente uma busca que você sabe "
+        f"que dá vazio antes de continuar -- é essencial que o resultado vazio esteja na tela agora.")
+    corners = _capture_two_corners(
+        log,
+        "Posicione o mouse EXATAMENTE no CANTO SUPERIOR ESQUERDO do resultado da pesquisa, "
+        "ponta a ponta (não precisa deixar margem -- ela é calculada automaticamente).",
+        "Agora o CANTO INFERIOR DIREITO, também exato (um canto de verdade diferente do anterior).",
+    )
+    if corners is None:
+        log("Calibração cancelada pelo usuário.")
+        return False
+    ex1, ey1, ex2, ey2 = corners
+    px1, py1 = ex1 - TABLE_REGION_PAD, ey1 - TABLE_REGION_PAD
+    px2, py2 = ex2 + TABLE_REGION_PAD, ey2 + TABLE_REGION_PAD
+    log(f"   Capturado: {ex1},{ey1} -> {ex2},{ey2} (+{TABLE_REGION_PAD}px de folga automática em cada lado).")
+
+    config["table_row_region"] = {
+        "x1": px1 - window_left, "y1": py1 - window_top,
+        "x2": px2 - window_left, "y2": py2 - window_top,
+    }
+
+    CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    log(f"\nCalibração salva em {CONFIG_PATH}")
+
+    log("\nSalvando templates de imagem do resultado (vazio)...")
+    _settle_before_screenshot(log)
+    try:
+        # Same padded box saved as TWO template variants: 'no_data_banner' for the
+        # empty/has-data appearance classification (see automation._classify_table_by_image),
+        # 'table_row_region' for auto_detect to relocate this whole area later.
+        _save_template("no_data_banner", (px1, py1, px2, py2), log)
+        _save_template("table_row_region", (px1, py1, px2, py2), log)
     except Exception as exc:
         log(f"   Aviso: não consegui salvar todos os templates ({exc}). "
             f"A calibração manual continua válida, só a automática pode não funcionar depois.")
@@ -170,48 +309,6 @@ def load_config():
     if not CONFIG_PATH.exists():
         return None
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-
-
-def calibrate_result_banners(log=print) -> bool:
-    """Optional, separate mini-calibration for the 'No data available in table'
-    banner. Kept apart from run_calibration() -- it requires the site to
-    actually be SHOWING that state at capture time (a real empty search), which
-    isn't true during normal calibration, and skipping it shouldn't force the
-    whole main wizard to be redone.
-
-    Once captured, automation.py recognizes that state by its on-screen
-    APPEARANCE (like it already does for buttons/fields) instead of trying to
-    OCR-read the row's text -- much more tolerant of a watermark overlapping it,
-    since it doesn't need to make out individual characters, just the overall
-    shape. Without this template, automation.py falls back to the older
-    OCR-based classification, so this is safe to skip or redo at any time.
-
-    Only distinguishes empty vs. has-data -- whether the CEP/Número was itself
-    invalid doesn't matter for the KEEP/ELIMINATE decision, so that case isn't
-    calibrated separately (it used to be, which just added an extra required
-    step for no real benefit)."""
-    log("=== CALIBRAÇÃO DO AVISO DE TABELA VAZIA (opcional) ===")
-    log("Isso ensina o sistema a RECONHECER (por aparência, não por texto) o aviso "
-        "'No data available in table' -- mais confiável que ler o texto quando a "
-        "marca d'água da sessão atrapalha.")
-
-    log("\n> Faça uma busca com um CEP/Número que você sabe que NÃO retorna dado "
-        "nenhum (mostra 'No data available in table'). Deixe essa tela visível.")
-    log("> Posicione o mouse no CANTO SUPERIOR ESQUERDO do aviso 'No data available in table'.")
-    tl = _wait_for_capture(log)
-    if tl is None:
-        log("Cancelado.")
-        return False
-    log("> Agora o CANTO INFERIOR DIREITO desse mesmo aviso.")
-    br = _wait_for_capture(log)
-    if br is None:
-        log("Cancelado.")
-        return False
-    box = (min(tl.x, br.x), min(tl.y, br.y), max(tl.x, br.x), max(tl.y, br.y))
-    _save_template("no_data_banner", box, log)
-
-    log("\nCalibração do aviso concluída.")
-    return True
 
 
 if __name__ == "__main__":

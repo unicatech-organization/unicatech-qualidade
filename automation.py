@@ -49,7 +49,6 @@ MOUSE_MOVE_SECONDS = 0.25  # visible glide instead of an instant teleport, but s
 MAX_LOGIN_RETRIES = 2  # how many consecutive "not logged in" checks before auto-pausing
 MAX_TEMPLATE_DRIFT_PX = 60  # see _locate_click_point's sanity check against the manual calibration point
 OCR_RETRIES = 4
-LOGIN_CHECK_INTERVAL = 6  # in dual-window mode, re-check login every N fills per lane (not every single one)
 
 
 class AutomationRunner:
@@ -78,6 +77,7 @@ class AutomationRunner:
         self._last_window_pos = None
         self._click_cache = {}  # (win.left, win.top, element_name) -> (x, y), see _locate_click_point
         self._region_cache = {}  # (win.left, win.top, element_name) -> (x1,y1,x2,y2), see _locate_region_box
+        self._scroll_offset_cache = {}  # (win.left, win.top) -> (dx, dy), see _get_scroll_offset
         self._force_recheck_login = True  # re-check on the very first item / right after a resume
         self._data_signatures = []  # cleaned "data" OCR texts seen so far, see _read_result
         self._pre_search_snapshot = {}  # (win.left, win.top) -> pre-click table snapshot, see _start_search
@@ -127,17 +127,18 @@ class AutomationRunner:
 
     # ---------- window/session helpers ----------
     def _get_window(self):
-        # Primary: relocate the DOCUMENTO label by its saved appearance and find the
-        # window underneath that exact point. This is far more reliable than matching
-        # by window title -- title-substring lookups can pick the wrong window when
-        # more than one shares similar text (e.g. a stale/minimized duplicate). The
-        # label stays on screen and unchanged regardless of which fields (CEP/Número)
-        # we're actually typing into.
+        # Primary: relocate the Pesquisar button by its saved appearance and find
+        # the window underneath that exact point. This is far more reliable than
+        # matching by window title -- title-substring lookups can pick the wrong
+        # window when more than one shares similar text (e.g. a stale/minimized
+        # duplicate). Reuses the same button template that's already required for
+        # clicking (and for the login check), instead of keeping a separate
+        # element calibrated just for this.
         if auto_detect.has_templates():
-            marker_box, _variant = auto_detect._locate_box("app_marker_region", lambda *a, **k: None)
-            if marker_box is not None:
-                anchor_x = marker_box.left + marker_box.width // 2
-                anchor_y = marker_box.top + marker_box.height // 2
+            btn_box, _variant = auto_detect._locate_box("pesquisar_button", lambda *a, **k: None)
+            if btn_box is not None:
+                anchor_x = btn_box.left + btn_box.width // 2
+                anchor_y = btn_box.top + btn_box.height // 2
                 win = citrix_utils.find_window_at_point(anchor_x, anchor_y)
                 if win is not None:
                     self._last_window_pos = (win.left, win.top)
@@ -160,26 +161,64 @@ class AutomationRunner:
         return win
 
     def _is_logged_in(self, win) -> bool:
+        """Checks whether the Pesquisar button is actually visible right now. If
+        the session logged out (or the page hasn't finished (re)loading), the
+        button genuinely isn't on screen, so appearance matching for it comes back
+        empty -- a much more direct signal than OCR-reading a label, and it
+        doesn't depend on Tesseract being installed at all. Falls back to
+        assuming logged-in when no template was ever calibrated for the button,
+        so a missing template doesn't block every run on a check it can't do."""
+        if not auto_detect.variant_paths("pesquisar_button"):
+            return True
         try:
-            x1, y1, x2, y2 = self._locate_region_box(win, "app_marker_region")
-            text = ocr_utils.read_text(x1, y1, x2, y2)
-            ok = ocr_utils.fuzzy_contains(text, "documento", threshold=0.6)
-            if not ok:
-                self.log(f"   (debug) OCR da região de verificação leu: '{text}' "
-                         f"(região abs: {x1},{y1} -> {x2},{y2}; janela em {win.left},{win.top})")
-            return ok
+            region = (win.left, win.top, win.width, win.height)
+            box, _variant = auto_detect._locate_box("pesquisar_button", lambda *a, **k: None, region=region)
+            return box is not None
         except Exception as exc:
             self.log(f"Aviso: falha ao checar sessão ({exc}).")
             return False
+
+    def _get_scroll_offset(self, win):
+        """How far the page has scrolled/reflowed since calibration, estimated
+        from where the Pesquisar button is actually found right now vs. where it
+        was calibrated. Applied as a correction to every OTHER element's
+        calibrated position before trusting/comparing against it.
+
+        Scrolling moves everything on the page by the same amount, so one
+        reliable anchor's drift tells us the drift for all of them -- and
+        Pesquisar is a much safer anchor for this than cep_field/numero_field,
+        which look like near-identical blank boxes and can't be trusted to
+        report a large drift accurately (that ambiguity is exactly what
+        MAX_TEMPLATE_DRIFT_PX below guards against). Without this, a scrolled
+        page would make every OTHER element's own appearance match get rejected
+        by that same guard for being "too far" from its pre-scroll calibrated
+        spot, silently falling back to the now-wrong pre-scroll position instead
+        of the correct new one."""
+        key = (win.left, win.top)
+        cached = self._scroll_offset_cache.get(key)
+        if cached is not None:
+            return cached
+
+        offset = (0, 0)
+        if auto_detect.has_templates() and "pesquisar_button" in self.config:
+            region = (win.left, win.top, win.width, win.height)
+            pos = auto_detect._locate_point("pesquisar_button", lambda *a, **k: None, region=region)
+            if pos is not None:
+                calibrated = citrix_utils.absolute_point(
+                    win, self.config["pesquisar_button"]["x"], self.config["pesquisar_button"]["y"]
+                )
+                offset = (pos.x - calibrated[0], pos.y - calibrated[1])
+
+        self._scroll_offset_cache[key] = offset
+        return offset
 
     def _locate_click_point(self, win, name: str):
         """Where to click `name` (cep_field/numero_field/pesquisar_button) for this window.
 
         Detecting by appearance on every single search (region-restricted to this
-        window, so 2-window mode can't cross-match the other lane's element) is what
-        makes the system adapt automatically to a layout change -- but doing it EVERY
-        time is expensive and eats into the speedup 2-window mode is supposed to give.
-        So: detect once per window and cache it; only re-detect if the cache is
+        window) is what makes the system adapt automatically to a layout change --
+        but doing it every time is a real OCR/appearance-matching cost, so it's
+        detected once per window and cached; only re-detected if the cache is
         explicitly invalidated (see _invalidate_click_cache, called when a search
         comes back as an error -- a good sign the layout may have shifted).
         """
@@ -191,6 +230,9 @@ class AutomationRunner:
         config_point = None
         if name in self.config:
             config_point = citrix_utils.absolute_point(win, self.config[name]["x"], self.config[name]["y"])
+            if name != "pesquisar_button":
+                dx, dy = self._get_scroll_offset(win)
+                config_point = (config_point[0] + dx, config_point[1] + dy)
 
         point = None
         if auto_detect.has_templates():
@@ -198,19 +240,21 @@ class AutomationRunner:
             pos = auto_detect._locate_point(name, lambda *a, **k: None, region=region)
             if pos is not None:
                 point = (pos.x, pos.y)
-                # Sanity check against the manually-calibrated point: cep_field,
-                # numero_field and documento_field are near-identical blank input
+                # Sanity check against the (scroll-corrected) calibrated point:
+                # cep_field and numero_field are near-identical blank input
                 # boxes, so appearance matching can confidently lock onto the
-                # WRONG one of the three (seen in practice: CEP typed into the
-                # Documento field). The manual calibration point is ground truth
-                # right after being (re)captured, so if the image match landed
-                # far from it, trust the manual point instead of the match.
+                # WRONG one of the two (seen in practice: CEP typed into the
+                # Número field). Comparing against the scroll-corrected point
+                # (not the raw pre-scroll one) means this guard still does its
+                # job on a scrolled page instead of rejecting every correct
+                # match just for having moved with the scroll.
                 if config_point is not None:
                     dx = point[0] - config_point[0]
                     dy = point[1] - config_point[1]
                     if (dx * dx + dy * dy) ** 0.5 > MAX_TEMPLATE_DRIFT_PX:
                         self.log(f"   Aviso: detecção por imagem de '{name}' achou {point}, longe "
-                                 f"do ponto calibrado manualmente {config_point} -- usando o calibrado.")
+                                 f"do ponto calibrado (já ajustado por scroll) {config_point} -- "
+                                 f"usando o calibrado.")
                         point = None
         if point is None:
             point = config_point
@@ -218,42 +262,13 @@ class AutomationRunner:
         self._click_cache[key] = point
         return point
 
-    def _field_ocr_box(self, win, name: str):
-        """Region to OCR-read back a filled field's value, for verification.
-
-        Deliberately crops a tight band around the CLICK point, not the matched
-        template's full box: some field templates are captured with extra context
-        above the input (e.g. its label -- see auto_detect._click_ratio), so the
-        matched box can span both the label line and the input line. Debug
-        screenshots showed that a crop spanning both lines reads back as EMPTY
-        every time, because the digit-only OCR call uses psm 7 (single text line)
-        -- it doesn't ever misread the label, it just fails outright on a
-        two-line image. The click point itself is calibrated to sit inside the
-        actual input, so cropping around just that stays single-line.
-
-        Horizontal pad is deliberately modest: on a tighter layout (seen on a
-        1600x900 machine vs. the 1920x1080 one this was tuned on), the fields
-        sit close enough together that a wide crop pulls in the neighboring
-        input box and even part of the Pesquisar button -- debug screenshots
-        showed exactly that, with OCR then garbling the reading (e.g. reading
-        '45102606' for an 8-digit CEP, or empty) despite the correct value
-        being clearly visible in the crop."""
-        x, y = self._locate_click_point(win, name)
-        # Asymmetric vertical pad: on a tighter layout the label sits close enough
-        # above the input that even +/-20 reaches up into it (confirmed by debug
-        # screenshots showing "Numero"/label text captured alongside the correct
-        # value, reading back empty for the same two-line reason as the box-based
-        # crop this replaced). Padding up less than down keeps the label out while
-        # still covering the full digit height below the click point.
-        return x - 70, y - 10, x + 70, y + 18
-
     def _locate_region_box(self, win, name: str, pad: int = 8):
-        """Where `name` (app_marker_region/table_row_region) is for this window, as
-        (x1, y1, x2, y2). Same appearance-detection-with-cache strategy as
-        _locate_click_point -- fixes the marker/table check reading the wrong spot
-        when the page has scrolled/reflowed since config.json's offsets were saved,
-        even though window-finding itself (which already re-detects fresh every
-        time) still works fine."""
+        """Where `name` (table_row_region) is for this window, as (x1, y1, x2, y2).
+        Same appearance-detection-with-cache strategy as _locate_click_point --
+        fixes the table-read crop pointing at the wrong spot when the page has
+        scrolled/reflowed since config.json's offsets were saved, even though
+        window-finding itself (which already re-detects fresh every time) still
+        works fine."""
         key = (win.left, win.top, name)
         cached = self._region_cache.get(key)
         if cached is not None:
@@ -262,6 +277,8 @@ class AutomationRunner:
         config_box = None
         if name in self.config:
             config_box = citrix_utils.absolute_region(win, self.config[name], pad=pad)
+            dx0, dy0 = self._get_scroll_offset(win)
+            config_box = (config_box[0] + dx0, config_box[1] + dy0, config_box[2] + dx0, config_box[3] + dy0)
 
         box = None
         if auto_detect.has_templates():
@@ -270,16 +287,18 @@ class AutomationRunner:
             if b is not None:
                 box = (b.left - pad, b.top - pad, b.left + b.width + pad, b.top + b.height + pad)
                 # Same sanity check as _locate_click_point: don't trust an
-                # appearance match that landed far from the manually calibrated
-                # region -- seen in practice as table-read OCR returning the
-                # same garbage every attempt because the crop was pinned to the
-                # wrong static spot on screen instead of the results table.
+                # appearance match that landed far from the (scroll-corrected)
+                # calibrated region -- seen in practice as table-read OCR
+                # returning the same garbage every attempt because the crop was
+                # pinned to the wrong static spot on screen instead of the
+                # results table.
                 if config_box is not None:
                     dx = box[0] - config_box[0]
                     dy = box[1] - config_box[1]
                     if (dx * dx + dy * dy) ** 0.5 > MAX_TEMPLATE_DRIFT_PX:
                         self.log(f"   Aviso: detecção por imagem de '{name}' achou {box}, longe "
-                                 f"da região calibrada manualmente {config_box} -- usando a calibrada.")
+                                 f"da região calibrada (já ajustada por scroll) {config_box} -- "
+                                 f"usando a calibrada.")
                         box = None
         if box is None:
             box = config_box
@@ -293,13 +312,9 @@ class AutomationRunner:
             del self._click_cache[key]
         for key in [k for k in self._region_cache if k[:2] == key_prefix]:
             del self._region_cache[key]
+        self._scroll_offset_cache.pop(key_prefix, None)
 
     # ---------- per-record processing ----------
-    def _read_field_digits(self, win, field_name: str) -> str:
-        x1, y1, x2, y2 = self._field_ocr_box(win, field_name)
-        text = ocr_utils.read_digits(x1, y1, x2, y2)
-        return re.sub(r"\D", "", text)
-
     def _fill_field(self, win, field_name: str, value: str):
         """Fill the field via a single clipboard paste (one paste action for the
         whole value) when available -- across every debug screenshot gathered
@@ -336,8 +351,7 @@ class AutomationRunner:
 
     def _start_search(self, cnpj: str, win):
         """Fill CEP + Número and hit Pesquisar. Does NOT wait for the result --
-        split out so a second window can be worked while this one is still loading
-        (see run_dual)."""
+        the caller is responsible for waiting before reading it back."""
         record = self._records_by_cnpj[cnpj]
 
         self._fill_field(win, "cep_field", record["cep"])
@@ -354,22 +368,6 @@ class AutomationRunner:
         # button differently while the fields are still empty vs. filled in.
         btn_x, btn_y = self._locate_click_point(win, "pesquisar_button")
         pyautogui.click(btn_x, btn_y, duration=MOUSE_MOVE_SECONDS)
-
-    def _verify_cep_field(self, win, cnpj: str) -> bool:
-        """Extra safety net (mainly for 2-window mode): confirm the CEP field in
-        `win` still shows the CEP we searched for THIS record, before trusting
-        whatever the table shows. Catches any window mixup -- wrong lane, a stale
-        cached click position, etc. -- instead of silently reporting a result for
-        the wrong CNPJ."""
-        record = self._records_by_cnpj.get(cnpj)
-        if not record or not record.get("cep"):
-            return True
-        got = self._read_field_digits(win, "cep_field")
-        expected = record["cep"]
-        match = bool(got) and (got == expected or got in expected or expected in got)
-        if not match:
-            self.log(f"   [{cnpj}] (debug) campo CEP leu '{got}' (esperado '{expected}').")
-        return match
 
     @staticmethod
     def _clean_for_signature(text: str) -> str:
@@ -414,7 +412,7 @@ class AutomationRunner:
 
     def _classify_table_by_image(self, win):
         """Recognize whether the table shows 'no data' by the on-screen
-        APPEARANCE of that banner (see calibration.calibrate_result_banners)
+        APPEARANCE of that banner (see calibration.run_calibration, part 2/3)
         instead of OCR-reading the row's text. Much more tolerant of the session
         watermark than character-level OCR -- it only needs to match the overall
         shape (same appearance-matching-with-retries as auto_detect already uses
@@ -435,21 +433,9 @@ class AutomationRunner:
         no_data_box, _ = auto_detect._locate_box("no_data_banner", lambda *a, **k: None, region=region)
         return "empty" if no_data_box is not None else "data"
 
-    def _read_result(self, cnpj: str, win, verify: bool = False) -> str:
+    def _read_result(self, cnpj: str, win) -> str:
         """OCR-classify the results table for the search already triggered on `win`.
-        Caller is responsible for having waited long enough beforehand.
-
-        `verify=True` first confirms the CEP field still shows this record's CEP --
-        only meaningful (and only worth the extra OCR call) in 2-window mode, where
-        a mixup between lanes is actually possible; single-window mode can't have
-        that problem, so it skips this check entirely."""
-        if verify and not self._verify_cep_field(win, cnpj):
-            self.log(f"   [{cnpj}] (debug) ALERTA: o campo CEP dessa janela não bate com o esperado "
-                     f"na hora de ler o resultado -- pode ter havido mistura de janela. Marcando como "
-                     f"erro pra reprocessar depois, em vez de arriscar um resultado errado.")
-            self._invalidate_click_cache(win)
-            return STATUS_ERROR
-
+        Caller is responsible for having waited long enough beforehand."""
         rx1, ry1, rx2, ry2 = self._locate_region_box(win, "table_row_region")
 
         before = self._pre_search_snapshot.get((win.left, win.top))
@@ -523,12 +509,24 @@ class AutomationRunner:
 
         self.log(f"   [{cnpj}] Falha final de OCR (marca d'água persistente ou tabela ilegível). "
                  f"Última leitura: '{best_text}'")
+        # A persistently illegible table is also what you'd see if the page's
+        # internal layout shifted (scroll, reflow, zoom) without the WINDOW itself
+        # moving -- the click-position cache is keyed by window position, so it
+        # wouldn't notice that on its own. Invalidate it so the next attempt
+        # re-detects every position fresh instead of continuing to trust
+        # coordinates that may no longer be right.
+        self._invalidate_click_cache(win)
         return STATUS_ERROR
 
     def _process_one(self, cnpj: str, win) -> str:
-        """Single-lane version: search and wait for the fixed delay before reading."""
+        """Search, wait just long enough for the page to start responding, then
+        read. Doesn't need to wait for the FULL page load here -- _read_result
+        already retries (pre-search snapshot diff, then banner-recognition
+        attempts) until the result actually shows up, so a short initial wait
+        followed by those retries is faster in the common case than blindly
+        waiting out a fixed delay before even looking."""
         self._start_search(cnpj, win)
-        time.sleep(self.config.get("wait_after_search_seconds", 3.5))
+        time.sleep(self.config.get("wait_after_search_seconds", 1.0))
         return self._read_result(cnpj, win)
 
     def _ensure_ready(self):
@@ -545,7 +543,7 @@ class AutomationRunner:
 
         if not self._is_logged_in(win):
             self._consecutive_login_failures += 1
-            self.log(f"Aviso: não encontrei o campo DOCUMENTO na tela "
+            self.log(f"Aviso: não encontrei o botão Pesquisar na tela "
                      f"({self._consecutive_login_failures}/{MAX_LOGIN_RETRIES}). "
                      f"Pode ter deslogado ou a página não carregou.")
             if self._consecutive_login_failures >= MAX_LOGIN_RETRIES:
@@ -595,126 +593,6 @@ class AutomationRunner:
             time.sleep(delay + random.uniform(0, 0.5))
 
         finished_all = self.index >= total
-        if finished_all and not self._stop_event.is_set():
-            self._retry_errors()
-
-        self.log("Processamento finalizado." if finished_all else "Processamento interrompido.")
-        return self.results
-
-    # ---------- dual-window pipelined loop (~2x throughput) ----------
-    def run_dual(self, win_a, win_b):
-        """Interleave two windows: while one is waiting for its result to render,
-        the other is already typing/searching its next record. Roughly halves the
-        wall-clock time versus running the two windows one after another."""
-        total = len(self.records)
-        wait_s = self.config.get("wait_after_search_seconds", 3.5)
-
-        if (win_a.left, win_a.top) == (win_b.left, win_b.top):
-            # The two "windows" the caller found are actually the same physical
-            # window (a detection mixup) -- running dual mode on this would type
-            # both lanes' CNPJs into the SAME field and read mixed-up results.
-            # Refuse outright instead of risking silently wrong answers.
-            self.log("ERRO: as duas janelas detectadas para o modo 2 janelas são, na prática, "
-                     "a mesma janela (mesma posição). Abortando o modo 2 janelas para não misturar "
-                     "resultados -- rode no modo normal (1 janela) ou recalibre.")
-            return self.results
-
-        self.log(f"Iniciando processamento em modo 2 janelas de {total} registros "
-                 f"(a partir do item {self.index + 1}). Janela A em ({win_a.left},{win_a.top}), "
-                 f"janela B em ({win_b.left},{win_b.top}).")
-
-        lanes = [
-            {"win": win_a, "cnpj": None, "started": None, "login_failures": 0, "fills_since_check": 0},
-            {"win": win_b, "cnpj": None, "started": None, "login_failures": 0, "fills_since_check": 0},
-        ]
-
-        while self.index < total or any(lane["cnpj"] for lane in lanes):
-            if self._stop_event.is_set():
-                self.log("Parado pelo usuário.")
-                break
-            self._pause_event.wait()
-            if self._stop_event.is_set():
-                break
-
-            # Start a search on any idle lane that still has work available.
-            paused_mid_fill = False
-            for lane in lanes:
-                if lane["cnpj"] is None and self.index < total:
-                    citrix_utils.focus_window(lane["win"])
-                    time.sleep(0.05)
-
-                    # Checking login status is a real OCR call -- doing it on every
-                    # single item eats into the speedup this mode exists for. Only
-                    # do it occasionally, plus always right after start/resume.
-                    due_for_check = (
-                        self._force_recheck_login
-                        or lane["fills_since_check"] >= LOGIN_CHECK_INTERVAL
-                    )
-                    if due_for_check and not self._is_logged_in(lane["win"]):
-                        lane["login_failures"] += 1
-                        lane["fills_since_check"] = 0
-                        self.log(f"Aviso: uma janela parece deslogada "
-                                 f"({lane['login_failures']}/{MAX_LOGIN_RETRIES}).")
-                        if lane["login_failures"] >= MAX_LOGIN_RETRIES:
-                            self.log("Pausando automaticamente para você relogar.")
-                            self.pause()
-                            self.on_logout()
-                            paused_mid_fill = True
-                            break
-                        continue  # give this lane another shot next loop tick, other lane keeps going
-                    if due_for_check:
-                        lane["login_failures"] = 0
-                        lane["fills_since_check"] = 0
-                    else:
-                        lane["fills_since_check"] += 1
-
-                    cnpj = self.cnpj_list[self.index]
-                    self.index += 1
-                    self.log(f"   [{cnpj}] buscando na janela em {lane['win'].left},{lane['win'].top}...")
-                    try:
-                        self._start_search(cnpj, lane["win"])
-                    except Exception as exc:
-                        self.log(f"   [{cnpj}] Erro ao iniciar busca: {exc}")
-                        self.results[cnpj] = STATUS_ERROR
-                        self._save_checkpoint()
-                        self.on_progress(self.index, total, cnpj, STATUS_ERROR)
-                        continue
-                    lane["cnpj"] = cnpj
-                    lane["started"] = time.time()
-
-            self._force_recheck_login = False
-
-            if paused_mid_fill:
-                continue
-
-            # Collect any lane whose wait has elapsed.
-            progressed = False
-            for lane in lanes:
-                if lane["cnpj"] is not None and time.time() - lane["started"] >= wait_s:
-                    cnpj = lane["cnpj"]
-                    try:
-                        status = self._read_result(cnpj, lane["win"], verify=True)
-                    except Exception as exc:
-                        self.log(f"   [{cnpj}] Erro inesperado: {exc}")
-                        status = STATUS_ERROR
-                    if status == STATUS_ERROR:
-                        # Might mean the layout shifted under us -- force a fresh
-                        # detection (and an earlier login re-check) next time
-                        # instead of trusting the possibly-stale cached position.
-                        self._invalidate_click_cache(lane["win"])
-                        lane["fills_since_check"] = LOGIN_CHECK_INTERVAL
-                    self.results[cnpj] = status
-                    self.log(f"   [{cnpj}] (janela em {lane['win'].left},{lane['win'].top}) -> {status.upper()}")
-                    self._save_checkpoint()
-                    self.on_progress(self.index, total, cnpj, status)
-                    lane["cnpj"] = None
-                    lane["started"] = None
-                    progressed = True
-
-            if not progressed:
-                time.sleep(0.3)
-
-        finished_all = self.index >= total and not any(lane["cnpj"] for lane in lanes)
         if finished_all and not self._stop_event.is_set():
             self._retry_errors()
 

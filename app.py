@@ -50,16 +50,6 @@ class App(tk.Tk):
         self.pause_btn.grid(row=0, column=4, padx=4)
         self.stop_btn = ttk.Button(top, text="Parar", command=self._on_stop, state="disabled")
         self.stop_btn.grid(row=0, column=5, padx=4)
-        ttk.Button(top, text="Calibrar aviso de tabela vazia (opcional)", command=self._on_calibrate_banners).grid(
-            row=1, column=0, columnspan=2, padx=4, pady=(4, 0), sticky="w")
-
-        top2 = ttk.Frame(self, padding=(10, 0))
-        top2.pack(fill="x")
-        self.dual_window_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            top2, text="Usar 2 janelas do Citrix lado a lado (~2x mais rápido)",
-            variable=self.dual_window_var,
-        ).pack(anchor="w")
 
         info = ttk.Frame(self, padding=(10, 0))
         info.pack(fill="x")
@@ -115,20 +105,6 @@ class App(tk.Tk):
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_calibrate_banners(self):
-        if self.runner_thread and self.runner_thread.is_alive():
-            messagebox.showwarning("Aviso", "Pare a automação antes de calibrar novamente.")
-            return
-
-        def worker():
-            ok = calibration.calibrate_result_banners(log=self.log)
-            if ok:
-                self.log("Calibração dos avisos concluída com sucesso.")
-            else:
-                self.log("Calibração dos avisos não foi concluída.")
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def _on_auto_calibrate(self):
         if self.runner_thread and self.runner_thread.is_alive():
             messagebox.showwarning("Aviso", "Pare a automação antes de recalibrar.")
@@ -178,19 +154,6 @@ class App(tk.Tk):
             messagebox.showwarning("Lista pendente", "Upe uma lista (passo 2) antes de iniciar.")
             return
 
-        use_dual = self.dual_window_var.get()
-        win_a = win_b = None
-        if use_dual:
-            windows = auto_detect.locate_all_windows(log=self.log)
-            if len(windows) < 2:
-                self.log(f"Modo 2 janelas: só encontrei {len(windows)} janela(s) na tela. "
-                         f"Seguindo no modo normal (1 janela) em vez de travar.")
-                use_dual = False
-            else:
-                win_a, win_b = windows[0], windows[1]
-                self.log(f"Modo 2 janelas: janela A em ({win_a.left},{win_a.top}), "
-                         f"janela B em ({win_b.left},{win_b.top}).")
-
         signature = io_utils.file_signature(self.input_path)
         self.runner = automation.AutomationRunner(
             config=config,
@@ -207,10 +170,7 @@ class App(tk.Tk):
         self.is_paused = False
 
         def worker():
-            if use_dual:
-                results = self.runner.run_dual(win_a, win_b)
-            else:
-                results = self.runner.run()
+            results = self.runner.run()
             self._finish_run(results)
 
         self.runner_thread = threading.Thread(target=worker, daemon=True)
@@ -256,11 +216,12 @@ class App(tk.Tk):
         OUTPUT_DIR.mkdir(exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_path = OUTPUT_DIR / f"resultado_{ts}.xlsx"
-        io_utils.write_output_excel(results, str(out_path))
+        records = self.runner.records if self.runner else []
+        io_utils.write_output_excel(records, results, str(out_path))
         self.log(f"Arquivo de saída gerado: {out_path}")
 
         errors_path = OUTPUT_DIR / f"erros_{ts}.xlsx"
-        if io_utils.write_errors_excel(results, str(errors_path)):
+        if io_utils.write_errors_excel(records, results, str(errors_path)):
             self.log(f"Planilha de erros gerada: {errors_path}")
 
         kept = sum(1 for s in results.values() if s == "mantido")

@@ -1,13 +1,11 @@
 """Small OCR helpers tuned for reading short UI strings off a screenshot region."""
 import difflib
 import re
-from collections import Counter
 
 import numpy as np
 import pytesseract
 from PIL import Image, ImageGrab, ImageOps
 
-ENTRIES_RE = re.compile(r"[o0]f\D{0,4}(\d+)\D{0,6}entries", re.IGNORECASE)
 PSM_MODES = (7, 6, 11, 13)
 PSM_MODES_FAST = (7, 6)  # the two that matter most in practice; used on the first (most likely to succeed) attempt
 NO_DATA_PHRASE = "no data available in table"
@@ -91,43 +89,6 @@ def _preprocess_variants(img: Image.Image, fast: bool = False):
     yield ImageOps.expand(strict, border=16, fill=255)
 
 
-def read_text(x1, y1, x2, y2, psm: int = 7) -> str:
-    """Single-pass read (used for the login/session marker check)."""
-    img = grab_region(x1, y1, x2, y2)
-    img = _upscale(img)
-    img = ImageOps.grayscale(img)
-    img = ImageOps.autocontrast(img)
-    return pytesseract.image_to_string(img, config=f"--psm {psm}").strip()
-
-
-def read_digits(x1, y1, x2, y2, psm: int = 7) -> str:
-    """Read a region that should contain ONLY digits (e.g. a CEP field), restricting
-    Tesseract's character set to 0-9. Much more reliable than general text OCR for
-    this -- it can't confuse a digit for a stray letter/symbol."""
-    img = grab_region(x1, y1, x2, y2)
-    img = _upscale(img)
-    img = ImageOps.grayscale(img)
-    img = ImageOps.autocontrast(img)
-    config = f"--psm {psm} -c tessedit_char_whitelist=0123456789"
-    return pytesseract.image_to_string(img, config=config).strip()
-
-
-def read_entries_total(x1, y1, x2, y2):
-    """Try several preprocessing variants x OCR modes to reliably parse the
-    'Showing X to Y of Z entries' counter. Returns (total_or_None, best_raw_text)."""
-    img = grab_region(x1, y1, x2, y2)
-    best_text = ""
-    for variant in _preprocess_variants(img):
-        for psm in PSM_MODES:
-            text = pytesseract.image_to_string(variant, config=f"--psm {psm}").strip()
-            if len(text) > len(best_text):
-                best_text = text
-            total = parse_entries_total(text)
-            if total is not None:
-                return total, text
-    return None, best_text
-
-
 def _best_substring_match(text: str, target: str):
     """Like _best_substring_ratio, but also returns the (start, end) window that
     scored best, so the caller can strip it out of `text` afterward."""
@@ -207,31 +168,11 @@ def classify_table_region(x1, y1, x2, y2, min_chars: int = 6, match_threshold: f
     # seen for confirmed real-data rows), so that band caused MORE misclassified
     # records (real data marked "erro") than it prevented. Distinguishing
     # "empty" from "data" once neither hits the confirmed 0.55 threshold isn't
-    # reliable from the row text alone -- read_entries_total()'s "Showing X to Y
-    # of Z entries" footer (unused today) is a cleaner signal if this needs
-    # revisiting, since it's a single number rather than a garbled row of text.
+    # reliable from the row text alone -- the site's "Showing X to Y of Z
+    # entries" footer would be a cleaner signal if this needs revisiting, since
+    # it's a single number rather than a garbled row of text (not implemented:
+    # no caller ever needed it enough to justify OCR-reading a second region).
     cleaned_best = re.sub(r"[^a-z]", "", best_text.lower())
     if len(cleaned_best) >= min_chars:
         return "data", best_text
     return "inconclusive", best_text
-
-
-def parse_entries_total(text: str):
-    """Extract the Z in 'Showing X to Y of Z entries'. Returns int or None if not found."""
-    match = ENTRIES_RE.search(text.replace(",", ""))
-    if match:
-        return int(match.group(1))
-    return None
-
-
-def fuzzy_contains(text: str, expected: str, threshold: float = 0.7) -> bool:
-    """Order-independent, noise-tolerant check: are most letters of `expected`
-    present in `text`? Handles OCR letter-scrambling caused by things like a
-    diagonal watermark crossing through the text (e.g. 'DNOCLIMENTO' vs 'DOCUMENTO').
-    """
-    t = re.sub(r"[^a-z]", "", text.lower())
-    e = re.sub(r"[^a-z]", "", expected.lower())
-    if not e:
-        return False
-    overlap = sum((Counter(t) & Counter(e)).values())
-    return (overlap / len(e)) >= threshold

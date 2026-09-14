@@ -8,6 +8,13 @@ wide layout vs. its narrow/responsive layout, which changes how some buttons loo
 Variants are stored as templates/<name>/1.png, 2.png, ... and are all tried in
 turn -- new variants only ever get ADDED (see calibration.py), so recalibrating
 for a new layout never throws away one that already works for another layout.
+
+Each element also keeps a single consolidated hit-rate file (templates/<name>/stats.json,
+keyed by filename) that's updated every time one of its variants is actually tried
+against the screen. variant_paths() uses it to try the best-performing variant
+first, and a variant that misses too many times IN A ROW with no success in
+between gets deleted automatically -- see DISCARD_AFTER_CONSECUTIVE_FAILURES and
+_record_attempt.
 """
 import json
 import time
@@ -25,25 +32,128 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 # confidence just enough to miss. A lower threshold + a couple of quick retries
 # (the watermark won't be in the exact same spot a few hundred ms later) makes this
 # reliable without needing a stricter/slower detection method.
-CONFIDENCE = 0.82
+CONFIDENCE = 0.80
 RETRIES = 3
 RETRY_DELAY_SECONDS = 0.4
 MAX_DRIFT_PX = 60  # see try_auto_calibrate's _guarded_point
 
 POINT_ELEMENTS = ["cep_field", "numero_field", "pesquisar_button"]
-REGION_ELEMENTS = ["app_marker_region", "table_row_region"]
+REGION_ELEMENTS = ["table_row_region"]
+
+# A variant that fails this many times IN A ROW (no success in between) gets
+# deleted -- see _record_attempt. Deliberately high: a variant can legitimately
+# go a long stretch without matching (e.g. it's the narrow-layout appearance and
+# the wide layout has been showing for a while), so this should only catch
+# variants that are essentially never going to work again, not ones that are
+# just temporarily out of rotation.
+DISCARD_AFTER_CONSECUTIVE_FAILURES = 40
+
+# Only these elements get effectiveness tracking/reordering/discarding.
+# 'no_data_banner' is deliberately excluded: it's matched against every search
+# result, and "not found" there just means the record HAS data (a normal, common
+# business outcome) -- not a sign the template stopped working, so treating those
+# misses as detection failures would get a perfectly good template discarded.
+_TRACKED_ELEMENTS = set(POINT_ELEMENTS) | set(REGION_ELEMENTS)
 
 
 def _variant_dir(name) -> Path:
     return TEMPLATES_DIR / name
 
 
+_DEFAULT_STATS = {"attempts": 0, "successes": 0, "consecutive_failures": 0}
+
+
+def _stats_file(name: str) -> Path:
+    return _variant_dir(name) / "stats.json"
+
+
+def _load_all_stats(name: str) -> dict:
+    """All variants' stats for this element in one dict, keyed by filename
+    (e.g. '1.png'). Transparently migrates old one-file-per-variant
+    '<n>.stats.json' sidecars into this consolidated file the first time this
+    element is touched (a leftover from before stats were consolidated), then
+    removes them so they don't keep piling up in the folder."""
+    consolidated_path = _stats_file(name)
+    data = {}
+    if consolidated_path.exists():
+        try:
+            data = json.loads(consolidated_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+
+    d = _variant_dir(name)
+    legacy_sidecars = list(d.glob("*.stats.json")) if d.exists() else []
+    if legacy_sidecars:
+        for sidecar in legacy_sidecars:
+            png_name = sidecar.name[: -len(".stats.json")] + ".png"
+            if png_name not in data:
+                try:
+                    data[png_name] = json.loads(sidecar.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            sidecar.unlink(missing_ok=True)
+        _save_all_stats(name, data)
+    return data
+
+
+def _save_all_stats(name: str, all_stats: dict):
+    _stats_file(name).write_text(json.dumps(all_stats, indent=2), encoding="utf-8")
+
+
+def _success_rate(stats: dict) -> float:
+    """Laplace-smoothed hit rate, so a variant with few attempts so far isn't
+    unfairly ranked first (a single lucky match) or last (a single early miss)
+    ahead of ones with a long, solid track record."""
+    return (stats["successes"] + 1) / (stats["attempts"] + 2)
+
+
+def _record_attempt(name: str, path: Path, matched: bool, log):
+    """Update the variant's hit-rate stats after actually trying to match it on
+    screen, and delete it if it's crossed the no-longer-useful threshold. Never
+    discards the last remaining variant for an element -- a consistently failing
+    template is still better than none (has_templates() would otherwise start
+    failing and force a full manual recalibration)."""
+    if name not in _TRACKED_ELEMENTS or not path.exists():
+        return
+    all_stats = _load_all_stats(name)
+    stats = dict(_DEFAULT_STATS, **all_stats.get(path.name, {}))
+    stats["attempts"] += 1
+    if matched:
+        stats["successes"] += 1
+        stats["consecutive_failures"] = 0
+    else:
+        stats["consecutive_failures"] += 1
+
+    if stats["consecutive_failures"] >= DISCARD_AFTER_CONSECUTIVE_FAILURES and len(variant_paths(name)) > 1:
+        log(f"  Descartando variante '{name}/{path.name}': não bateu em {stats['consecutive_failures']} "
+            f"tentativas seguidas -- provavelmente um layout antigo que não existe mais. "
+            f"Recalibre manualmente se essa aparência ainda for válida.")
+        path.unlink(missing_ok=True)
+        all_stats.pop(path.name, None)
+        _save_all_stats(name, all_stats)
+        return
+
+    all_stats[path.name] = stats
+    _save_all_stats(name, all_stats)
+
+
 def variant_paths(name):
-    """All saved appearance variants for an element, e.g. templates/pesquisar_button/1.png, 2.png..."""
+    """All saved appearance variants for an element, e.g. templates/pesquisar_button/1.png, 2.png...
+    -- ordered by hit rate (best first) for tracked elements, so the common case
+    (the variant that's been working) gets tried first instead of always paying
+    for a full sweep."""
     d = _variant_dir(name)
     if not d.exists():
         return []
-    return sorted(d.glob("*.png"), key=lambda p: p.stem)
+    paths = sorted(d.glob("*.png"), key=lambda p: p.stem)
+    if name in _TRACKED_ELEMENTS:
+        all_stats = _load_all_stats(name)
+        paths = sorted(
+            paths,
+            key=lambda p: _success_rate(dict(_DEFAULT_STATS, **all_stats.get(p.name, {}))),
+            reverse=True,
+        )
+    return paths
 
 
 def next_variant_path(name) -> Path:
@@ -76,7 +186,8 @@ def _locate_box(name, log, region=None):
     """Try every saved appearance variant of `name`, retrying a few full passes
     (transient watermark overlap can drop a match momentarily). Pass `region`
     (left, top, width, height) to constrain the search to a specific window --
-    important in 2-window mode so lane A's search can't match lane B's element.
+    keeps a multi-window desktop (other apps, a second Citrix session) from
+    matching something that isn't actually inside the app's own window.
     Returns (pyscreeze Box, variant_path) or (None, None)."""
     paths = variant_paths(name)
     if not paths:
@@ -91,6 +202,7 @@ def _locate_box(name, log, region=None):
                 box = pyautogui.locateOnScreen(str(path), **kwargs)
             except Exception:
                 box = None
+            _record_attempt(name, path, matched=(box is not None), log=log)
             if box is not None:
                 return box, path
         if attempt < RETRIES:
@@ -150,11 +262,6 @@ def try_auto_calibrate(log=print) -> bool:
         return False
     log(f"  Botão Pesquisar encontrado em {btn_pos}.")
 
-    marker_box = _locate_region("app_marker_region", log)
-    if marker_box is None:
-        return False
-    log(f"  Marcador de sessão (rótulo DOCUMENTO) encontrado em {marker_box}.")
-
     row_box = _locate_region("table_row_region", log)
     if row_box is None:
         return False
@@ -169,14 +276,14 @@ def try_auto_calibrate(log=print) -> bool:
 
     def _guarded_point(name, new_x, new_y):
         """Keep the freshly-detected point, UNLESS it drifted too far from the
-        last manually-calibrated one for this field. cep_field/numero_field/
-        documento_field are near-identical blank input boxes, so appearance
-        matching can confidently lock onto the WRONG one of the three (seen in
-        practice: CEP's point landing on the Documento field) -- and since this
-        function is what (re)writes config.json on every app startup, a bad
-        match here would silently overwrite a correct manual calibration before
-        the user ever gets to run anything. When that happens, keep the old
-        point and flag it instead of trusting the new one."""
+        last manually-calibrated one for this field. cep_field and numero_field
+        are near-identical blank input boxes, so appearance matching can
+        confidently lock onto the WRONG one of the two (seen in practice: CEP's
+        point landing on the Número field) -- and since this function is what
+        (re)writes config.json on every app startup, a bad match here would
+        silently overwrite a correct manual calibration before the user ever
+        gets to run anything. When that happens, keep the old point and flag it
+        instead of trusting the new one."""
         old = old_config.get(name)
         if old is not None:
             dx, dy = new_x - old["x"], new_y - old["y"]
@@ -188,7 +295,7 @@ def try_auto_calibrate(log=print) -> bool:
         return {"x": new_x, "y": new_y}
 
     def _guarded_region(name, new_x1, new_y1, new_x2, new_y2):
-        """Same guard as _guarded_point, for the two region elements. A region
+        """Same guard as _guarded_point, for the region element. A region
         match landing on the wrong spot silently corrupts the table-reading
         crop (seen in practice: stable garbage OCR output like 'rq |' every
         single attempt, because the crop was consistently pointed at the wrong
@@ -205,18 +312,12 @@ def try_auto_calibrate(log=print) -> bool:
 
     config = {
         "window_title_contains": citrix_utils.stable_title_anchor(win.title),
-        "wait_after_search_seconds": old_config.get("wait_after_search_seconds", 3.5),
+        "wait_after_search_seconds": old_config.get("wait_after_search_seconds", 1.0),
         "delay_between_cnpjs_seconds": old_config.get("delay_between_cnpjs_seconds", 0.7),
         "tesseract_cmd": old_config.get("tesseract_cmd", r"C:\Program Files\Tesseract-OCR\tesseract.exe"),
         "cep_field": _guarded_point("cep_field", int(cep_pos.x - win.left), int(cep_pos.y - win.top)),
         "numero_field": _guarded_point("numero_field", int(numero_pos.x - win.left), int(numero_pos.y - win.top)),
         "pesquisar_button": {"x": int(btn_pos.x - win.left), "y": int(btn_pos.y - win.top)},
-        "app_marker_region": _guarded_region(
-            "app_marker_region",
-            int(marker_box.left - win.left), int(marker_box.top - win.top),
-            int(marker_box.left + marker_box.width - win.left),
-            int(marker_box.top + marker_box.height - win.top),
-        ),
         "table_row_region": _guarded_region(
             "table_row_region",
             int(row_box.left - win.left), int(row_box.top - win.top),
@@ -228,49 +329,3 @@ def try_auto_calibrate(log=print) -> bool:
     CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     log(f"Calibração automática concluída e salva em {CONFIG_PATH}.")
     return True
-
-
-def locate_all_windows(log=print):
-    """Find every on-screen instance of the app (matched by the DOCUMENTO label
-    template, trying all its saved appearance variants) and return their underlying
-    windows, sorted left-to-right.
-
-    Used for the 2-window ('pipeline') mode: since both windows have identical
-    layout, the single calibrated set of relative offsets in config.json applies
-    to each window found here -- we just need each window's own top-left corner.
-    """
-    paths = variant_paths("app_marker_region")
-    if not paths:
-        log("Sem template salvo para 'app_marker_region' (rode a calibração ao menos uma vez).")
-        return []
-
-    all_boxes = []
-    for path in paths:
-        try:
-            all_boxes.extend(pyautogui.locateAllOnScreen(str(path), confidence=CONFIDENCE))
-        except Exception as exc:
-            log(f"Erro ao procurar instâncias da janela com '{path.name}': {exc}")
-
-    # The scan can yield several overlapping boxes for the same real match (and
-    # different variants can both match the same window); cluster by proximity and
-    # keep one representative center per cluster.
-    centers = []
-    for b in all_boxes:
-        cx, cy = b.left + b.width / 2, b.top + b.height / 2
-        if not any(abs(cx - ex) < 60 and abs(cy - ey) < 60 for ex, ey in centers):
-            centers.append((cx, cy))
-
-    windows = []
-    seen = set()
-    for cx, cy in centers:
-        win = citrix_utils.find_window_at_point(int(cx), int(cy))
-        if win is None:
-            continue
-        key = (win.left, win.top, win.width, win.height, win.title)
-        if key in seen:
-            continue
-        seen.add(key)
-        windows.append(win)
-
-    windows.sort(key=lambda w: w.left)
-    return windows

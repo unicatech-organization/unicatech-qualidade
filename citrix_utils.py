@@ -1,4 +1,5 @@
 """Helpers to locate and focus the remote (Citrix) application window."""
+import ctypes
 import time
 
 import pygetwindow as gw
@@ -11,6 +12,33 @@ except ImportError:
     _HAS_WIN32 = False
 
 
+def _make_process_dpi_aware():
+    """Without this, Windows scales window/cursor coordinates by the display's
+    DPI setting for any process that hasn't opted into per-monitor DPI awareness
+    -- so pygetwindow (Win32 GetWindowRect) and pyautogui.position() (GetCursorPos)
+    report positions in SCALED ("logical") pixels, while pyautogui/PIL screenshots
+    (used for all appearance matching) are always taken in real ("physical")
+    pixels. On any display scaled above 100% (125%/150%/etc, extremely common),
+    the two disagree on where things are -- every region computed from a window's
+    reported bounds then points at the wrong part of the actual screenshot,
+    producing exactly the kind of erratic, hard-to-explain detection failures
+    this was chasing (false-positive matches near the screen origin, a region
+    search consistently missing something an unrestricted search just found).
+    Must run before any window/screen query -- this module is imported early
+    enough by everything else (automation, calibration, auto_detect) that
+    module-level execution here covers every entry point."""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()  # fallback for older Windows
+        except Exception:
+            pass
+
+
+_make_process_dpi_aware()
+
+
 def find_window(title_contains: str):
     """Return the first window whose title contains the given substring (case-insensitive)."""
     title_contains = title_contains.lower()
@@ -18,14 +46,6 @@ def find_window(title_contains: str):
         if w.title and title_contains in w.title.lower():
             return w
     return None
-
-
-def get_active_window_info():
-    """Return (title, left, top) of the currently active/focused window."""
-    w = gw.getActiveWindow()
-    if w is None:
-        return None
-    return {"title": w.title, "left": w.left, "top": w.top}
 
 
 def stable_title_anchor(full_title: str) -> str:

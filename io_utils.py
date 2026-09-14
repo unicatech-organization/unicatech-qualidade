@@ -22,6 +22,13 @@ def _digits(value) -> str:
     return re.sub(r"\D", "", str(value)) if value is not None else ""
 
 
+def _normalize_cep(cep: str) -> str:
+    """CEP always has 8 digits, but Excel frequently drops the leading zero when
+    the column is stored as a number (e.g. '01310-100' becomes 1310100). Pad it
+    back out so the site search isn't sent a truncated CEP."""
+    return cep.zfill(8) if cep else cep
+
+
 def load_search_list_from_excel(path: str):
     """Read an .xlsx file and return (records, columns_used).
 
@@ -47,7 +54,7 @@ def load_search_list_from_excel(path: str):
 
     records = []
     for _, row in df.iterrows():
-        cep = _digits(row.get(cep_col))
+        cep = _normalize_cep(_digits(row.get(cep_col)))
         numero = _digits(row.get(numero_col))
         if not cep and not numero:
             continue
@@ -70,17 +77,29 @@ def file_signature(path: str) -> str:
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
-def write_output_excel(results: dict, out_path: str):
-    """Write four sheets: 'Elegiveis' (kept = no data found), 'Log completo' (all
-    statuses), 'Erros' (CNPJs that still errored out after the retry pass) and
+def write_output_excel(records, results: dict, out_path: str):
+    """Write four sheets: 'Elegiveis' (kept = no data found), 'Log completo' (every
+    CEP from the input, with or without a result, each flagged by its status),
+    'Erros' (CNPJs that still errored out after the retry pass) and
     'CEP_ou_Numero_invalido' (rows where the source spreadsheet's CEP/Número was
     missing or rejected by the site -- not a real search outcome, worth fixing
-    and re-running separately)."""
-    rows = [{"CNPJ": cnpj, "status": status} for cnpj, status in results.items()]
-    df_all = pd.DataFrame(rows)
-    df_keep = df_all[df_all["status"] == "mantido"][["CNPJ"]]
-    df_errors = df_all[df_all["status"] == "erro"][["CNPJ"]]
-    df_invalid = df_all[df_all["status"] == "cep_ou_numero_invalido"][["CNPJ"]]
+    and re-running separately).
+
+    Takes the full input `records` (not just `results`) so every sheet shows the
+    actual CEP/Número searched, not just the CNPJ -- `results` alone only maps
+    cnpj -> status, which isn't enough to tell which CEP a row is about."""
+    rows = [
+        {"CNPJ": r["cnpj"], "CEP": r.get("cep", ""), "Numero": r.get("numero", ""),
+         "status": results.get(r["cnpj"], "")}
+        for r in records
+    ]
+    # Explicit columns so an empty run (e.g. stopped before processing anything)
+    # still gets a DataFrame with these columns to filter on, instead of one with
+    # no columns at all (pd.DataFrame([]) infers none from zero rows).
+    df_all = pd.DataFrame(rows, columns=["CNPJ", "CEP", "Numero", "status"])
+    df_keep = df_all[df_all["status"] == "mantido"]
+    df_errors = df_all[df_all["status"] == "erro"]
+    df_invalid = df_all[df_all["status"] == "cep_ou_numero_invalido"]
 
     with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
         df_keep.to_excel(writer, sheet_name="Elegiveis", index=False)
@@ -89,11 +108,14 @@ def write_output_excel(results: dict, out_path: str):
         df_invalid.to_excel(writer, sheet_name="CEP_ou_Numero_invalido", index=False)
 
 
-def write_errors_excel(results: dict, out_path: str) -> bool:
-    """Write a standalone spreadsheet with just the CNPJs that errored out.
-    Returns False (and writes nothing) if there are no errors."""
-    error_cnpjs = [cnpj for cnpj, status in results.items() if status == "erro"]
-    if not error_cnpjs:
+def write_errors_excel(records, results: dict, out_path: str) -> bool:
+    """Write a standalone spreadsheet with the CEP/Número/CNPJ of records that
+    errored out. Returns False (and writes nothing) if there are no errors."""
+    rows = [
+        {"CNPJ": r["cnpj"], "CEP": r.get("cep", ""), "Numero": r.get("numero", "")}
+        for r in records if results.get(r["cnpj"]) == "erro"
+    ]
+    if not rows:
         return False
-    pd.DataFrame({"CNPJ": error_cnpjs}).to_excel(out_path, sheet_name="Erros", index=False)
+    pd.DataFrame(rows, columns=["CNPJ", "CEP", "Numero"]).to_excel(out_path, sheet_name="Erros", index=False)
     return True

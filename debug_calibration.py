@@ -11,6 +11,8 @@ import keyboard
 import pygetwindow as gw
 import pyautogui
 
+import citrix_utils  # noqa: F401 -- import side effect makes this process DPI-aware, see citrix_utils._make_process_dpi_aware
+
 print("=== TESTE 1: listar todas as janelas visíveis ===")
 for w in gw.getAllWindows():
     if w.title.strip():
