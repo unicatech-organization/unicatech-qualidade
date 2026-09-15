@@ -9,6 +9,12 @@ use for real), then read the printed report.
 Rode: python diagnose_click.py
 """
 import ctypes
+import sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+except Exception:
+    pass
 
 import auto_detect
 import calibration
@@ -57,9 +63,16 @@ def main():
         return
     print()
 
+    print(f"Procurando janela cujo título contenha: '{config['window_title_contains']}'")
     win = citrix_utils.find_window(config["window_title_contains"])
     if win is None:
-        print("Não encontrei a janela do Citrix pelo título. Abra-a e rode de novo.")
+        print("Não encontrei a janela do Citrix pelo título. Abra-a (visível, não minimizada) e rode de novo.")
+        print("\nTítulos de janela visíveis agora, pra comparar com o que está configurado acima:")
+        import pygetwindow as gw
+        for w in gw.getAllWindows():
+            if w.title.strip():
+                safe_title = w.title.encode("ascii", "backslashreplace").decode("ascii")
+                print(f"  visible={w.visible!s:5}  '{safe_title}'")
         return
     print(f"Janela encontrada por título: '{win.title}'")
     print(f"  left={win.left}, top={win.top}, width={win.width}, height={win.height}\n")
