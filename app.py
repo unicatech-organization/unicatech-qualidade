@@ -8,11 +8,28 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 import keyboard
 import pyautogui
+import pystray
+from PIL import Image, ImageDraw
 
 import auto_detect
 import automation
 import calibration
 import io_utils
+
+STATUS_TRAY_COLORS = {
+    "mantido": (0, 170, 0, 255),      # verde
+    "eliminado": (240, 200, 0, 255),  # amarelo
+    "erro": (210, 30, 30, 255),       # vermelho
+}
+TRAY_IDLE_COLOR = (150, 150, 150, 255)  # cinza
+
+
+def _make_dot_image(color, size=64):
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    margin = 4
+    draw.ellipse((margin, margin, size - margin, size - margin), fill=color)
+    return img
 
 pyautogui.FAILSAFE = True  # jogue o mouse pro canto superior-esquerdo da tela para abortar na hora
 pyautogui.PAUSE = 0.05
@@ -36,8 +53,36 @@ class App(tk.Tk):
 
         self._build_ui()
         self._register_hotkeys()
+        self._setup_tray_icon()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(150, self._drain_log_queue)
         self.after(100, self._drain_hotkey_queue)
+
+    # ---------------- system tray ----------------
+    def _setup_tray_icon(self):
+        self._tray_images = {status: _make_dot_image(color) for status, color in STATUS_TRAY_COLORS.items()}
+        self._tray_images["idle"] = _make_dot_image(TRAY_IDLE_COLOR)
+        self.tray_icon = pystray.Icon(
+            "automacao_vivo",
+            self._tray_images["idle"],
+            "Automação Vivo Qualidade",
+            menu=pystray.Menu(
+                pystray.MenuItem("Mostrar janela", lambda icon, item: self.after(0, self._tray_show)),
+                pystray.MenuItem("Sair", lambda icon, item: self.after(0, self._on_close)),
+            ),
+        )
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def _tray_show(self):
+        self.deiconify()
+        self.lift()
+
+    def _on_close(self):
+        try:
+            self.tray_icon.stop()
+        except Exception:
+            pass
+        self.destroy()
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -74,6 +119,15 @@ class App(tk.Tk):
         self.progress.pack(fill="x")
         self.progress_label = ttk.Label(prog_frame, text="0 / 0")
         self.progress_label.pack(anchor="e")
+
+        stats_frame = ttk.Frame(self, padding=(10, 0))
+        stats_frame.pack(fill="x")
+        self.kept_var = tk.StringVar(value="Mantido: 0 (0%)")
+        self.eliminated_var = tk.StringVar(value="Eliminado: 0 (0%)")
+        self.error_var = tk.StringVar(value="Erro: 0 (0%)")
+        ttk.Label(stats_frame, textvariable=self.kept_var).pack(side="left", padx=(0, 16))
+        ttk.Label(stats_frame, textvariable=self.eliminated_var).pack(side="left", padx=(0, 16))
+        ttk.Label(stats_frame, textvariable=self.error_var).pack(side="left")
 
         console_frame = ttk.Frame(self, padding=10)
         console_frame.pack(fill="both", expand=True)
@@ -156,6 +210,9 @@ class App(tk.Tk):
                  f"(CEP: '{columns_used['cep']}', Número: '{columns_used['numero']}', CNPJ: '{cnpj_col}').")
         self.progress.configure(maximum=len(records), value=0)
         self.progress_label.config(text=f"0 / {len(records)}")
+        self.kept_var.set("Mantido: 0 (0%)")
+        self.eliminated_var.set("Eliminado: 0 (0%)")
+        self.error_var.set("Erro: 0 (0%)")
         self.start_btn.configure(state="normal")
 
     def _on_start(self):
@@ -193,7 +250,13 @@ class App(tk.Tk):
         self.pause_btn.configure(state="normal", text="Pausar")
         self.stop_btn.configure(state="normal")
         self.is_paused = False
+        self.tray_icon.icon = self._tray_images["idle"]
 
+        self.log("Minimizando... a automação começa a mexer na tela em 5 segundos.")
+        self.iconify()
+        self.after(5000, self._launch_runner_thread)
+
+    def _launch_runner_thread(self):
         def worker():
             results = self.runner.run()
             self._finish_run(results)
@@ -259,11 +322,33 @@ class App(tk.Tk):
     def _on_progress(self, index, total, cnpj, status):
         self.progress.configure(value=index)
         self.progress_label.config(text=f"{index} / {total}  (último: {cnpj} -> {status})")
+        self._update_stats()
+        tray_img = self._tray_images.get(status)
+        if tray_img is not None:
+            self.tray_icon.icon = tray_img
+
+    def _update_stats(self):
+        if not self.runner:
+            return
+        results = self.runner.results
+        total = len(self.runner.records)
+        kept = sum(1 for s in results.values() if s == "mantido")
+        eliminated = sum(1 for s in results.values() if s == "eliminado")
+        errors = sum(1 for s in results.values() if s == "erro")
+
+        def pct(n):
+            return (n / total * 100) if total else 0
+
+        self.kept_var.set(f"Mantido: {kept} ({pct(kept):.1f}%)")
+        self.eliminated_var.set(f"Eliminado: {eliminated} ({pct(eliminated):.1f}%)")
+        self.error_var.set(f"Erro: {errors} ({pct(errors):.1f}%)")
 
     def _finish_run(self, results):
         self.start_btn.configure(state="normal")
         self.pause_btn.configure(state="disabled")
         self.stop_btn.configure(state="disabled")
+        self._update_stats()
+        self.tray_icon.icon = self._tray_images["idle"]
 
         OUTPUT_DIR.mkdir(exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")

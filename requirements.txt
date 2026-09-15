@@ -7,3 +7,4 @@ keyboard
 pygetwindow
 pywin32
 opencv-python
+pystray
