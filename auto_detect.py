@@ -23,9 +23,7 @@ from pathlib import Path
 import pyautogui
 
 import citrix_utils
-
-TEMPLATES_DIR = Path(__file__).parent / "templates"
-CONFIG_PATH = Path(__file__).parent / "config.json"
+import profiles
 
 # The session watermark (timestamp/IP text) drifts across the page and occasionally
 # overlaps one of these elements right at screenshot time, which can drop the match
@@ -56,8 +54,8 @@ DISCARD_AFTER_CONSECUTIVE_FAILURES = 40
 _TRACKED_ELEMENTS = set(POINT_ELEMENTS) | set(REGION_ELEMENTS)
 
 
-def _variant_dir(name) -> Path:
-    return TEMPLATES_DIR / name
+def _variant_dir(name):
+    return profiles.templates_dir() / name
 
 
 _DEFAULT_STATS = {"attempts": 0, "successes": 0, "consecutive_failures": 0}
@@ -228,7 +226,7 @@ def _locate_region(name, log, region=None):
 
 
 def has_templates() -> bool:
-    if not TEMPLATES_DIR.exists():
+    if not profiles.templates_dir().exists():
         return False
     return all(variant_paths(n) for n in POINT_ELEMENTS + REGION_ELEMENTS)
 
@@ -267,10 +265,11 @@ def try_auto_calibrate(log=print) -> bool:
         return False
     log(f"  Região da tabela encontrada em {row_box}.")
 
+    config_path = profiles.config_path()
     old_config = {}
-    if CONFIG_PATH.exists():
+    if config_path.exists():
         try:
-            old_config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            old_config = json.loads(config_path.read_text(encoding="utf-8"))
         except Exception:
             pass
 
@@ -326,6 +325,7 @@ def try_auto_calibrate(log=print) -> bool:
         ),
     }
 
-    CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
-    log(f"Calibração automática concluída e salva em {CONFIG_PATH}.")
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    log(f"Calibração automática concluída e salva em {config_path}.")
     return True

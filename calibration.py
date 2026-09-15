@@ -14,7 +14,6 @@ the way to (re)generate the backup templates for auto-detection.
 """
 import json
 import time
-from pathlib import Path
 
 import keyboard
 import pyautogui
@@ -22,6 +21,7 @@ from PIL import ImageGrab
 
 import auto_detect
 import citrix_utils
+import profiles
 
 try:
     import win32clipboard
@@ -29,7 +29,6 @@ try:
 except ImportError:
     _HAS_CLIPBOARD = False
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
 CAPTURE_KEY = "f8"
 CANCEL_KEY = "esc"
 
@@ -287,8 +286,10 @@ def run_calibration(log=print):
         "x2": px2 - window_left, "y2": py2 - window_top,
     }
 
-    CONFIG_PATH.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
-    log(f"\nCalibração salva em {CONFIG_PATH}")
+    config_path = profiles.config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+    log(f"\nCalibração salva em {config_path} (perfil ativo: '{profiles.get_active_profile()}')")
 
     log("\nSalvando templates de imagem do resultado (vazio)...")
     _settle_before_screenshot(log)
@@ -306,9 +307,10 @@ def run_calibration(log=print):
 
 
 def load_config():
-    if not CONFIG_PATH.exists():
+    config_path = profiles.config_path()
+    if not config_path.exists():
         return None
-    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    return json.loads(config_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

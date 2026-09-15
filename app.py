@@ -15,6 +15,7 @@ import auto_detect
 import automation
 import calibration
 import io_utils
+import profiles
 
 STATUS_TRAY_COLORS = {
     "mantido": (0, 170, 0, 255),      # verde
@@ -41,7 +42,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Automação Vivo Qualidade - Checagem de CNPJ")
-        self.geometry("760x560")
+        self.geometry("760x590")
 
         self.log_queue = queue.Queue()
         self.hotkey_queue = queue.Queue()
@@ -86,6 +87,18 @@ class App(tk.Tk):
 
     # ---------------- UI ----------------
     def _build_ui(self):
+        profile_frame = ttk.Frame(self, padding=(10, 10, 10, 0))
+        profile_frame.pack(fill="x")
+        ttk.Label(profile_frame, text="Perfil de calibração (DPI/escala):").pack(side="left")
+        self.profile_var = tk.StringVar(value=profiles.get_active_profile())
+        self.profile_combo = ttk.Combobox(
+            profile_frame, textvariable=self.profile_var, values=profiles.list_profiles(),
+            state="readonly", width=20,
+        )
+        self.profile_combo.pack(side="left", padx=(6, 6))
+        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_selected)
+        ttk.Button(profile_frame, text="+ Novo perfil", command=self._on_new_profile).pack(side="left")
+
         top = ttk.Frame(self, padding=10)
         top.pack(fill="x")
 
@@ -156,6 +169,44 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self.after(150, self._drain_log_queue)
+
+    # ---------------- profiles ----------------
+    def _on_profile_selected(self, _event=None):
+        if self.runner_thread and self.runner_thread.is_alive():
+            messagebox.showwarning("Aviso", "Pare a automação antes de trocar de perfil.")
+            self.profile_var.set(profiles.get_active_profile())
+            return
+        name = self.profile_var.get()
+        profiles.set_active_profile(name)
+        self.log(f"Perfil de calibração ativo: '{name}'.")
+        config = calibration.load_config()
+        self.start_btn.configure(state=("normal" if (config is not None and self.records) else "disabled"))
+        if config is None:
+            self.log(f"O perfil '{name}' ainda não tem calibração salva -- rode o passo 1 "
+                     "(ou a calibração automática) antes de iniciar.")
+
+    def _on_new_profile(self):
+        if self.runner_thread and self.runner_thread.is_alive():
+            messagebox.showwarning("Aviso", "Pare a automação antes de criar um novo perfil.")
+            return
+        from tkinter import simpledialog
+        name = simpledialog.askstring(
+            "Novo perfil",
+            "Nome do novo perfil (ex.: 'Ratio 1.07' ou o nome do PC/monitor):",
+            parent=self,
+        )
+        if not name:
+            return
+        if not profiles.create_profile(name):
+            messagebox.showerror("Erro", f"Não foi possível criar o perfil '{name}' "
+                                          "(nome vazio, reservado ou já existente).")
+            return
+        self.profile_combo.configure(values=profiles.list_profiles())
+        self.profile_var.set(name)
+        profiles.set_active_profile(name)
+        self.start_btn.configure(state="disabled")
+        self.log(f"Perfil '{name}' criado e ativado. Rode a calibração (passo 1) "
+                 "agora, com a tela/escala desse ambiente, para preenchê-lo.")
 
     # ---------------- actions ----------------
     def _on_calibrate(self):
