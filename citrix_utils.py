@@ -1,5 +1,6 @@
 """Helpers to locate and focus the remote (Citrix) application window."""
 import ctypes
+import os
 import time
 
 import pygetwindow as gw
@@ -7,9 +8,34 @@ import pygetwindow as gw
 try:
     import win32con
     import win32gui
+    import win32process
     _HAS_WIN32 = True
 except ImportError:
     _HAS_WIN32 = False
+
+_OWN_PID = os.getpid()
+
+
+def _window_pid(win):
+    """PID that owns this window, or None if it can't be determined. Used to
+    make sure window searches never match the automation's OWN GUI window --
+    its title ('Automação Vivo Qualidade...') contains the same 'vivo
+    qualidade' substring used to find the actual Citrix window, so without
+    this a search can latch onto our own (even minimized) window instead of
+    the real target -- seen in practice corrupting a whole calibration
+    profile with the GUI's own title."""
+    hwnd = getattr(win, "_hWnd", None)
+    if not hwnd:
+        return None
+    try:
+        if _HAS_WIN32:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            return pid
+        pid = ctypes.c_ulong()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return pid.value
+    except Exception:
+        return None
 
 
 def _make_process_dpi_aware():
@@ -40,10 +66,13 @@ _make_process_dpi_aware()
 
 
 def find_window(title_contains: str):
-    """Return the first window whose title contains the given substring (case-insensitive)."""
+    """Return the first window whose title contains the given substring
+    (case-insensitive), skipping the automation's own GUI window -- its title
+    contains 'vivo qualidade' too, so without this it's a valid (wrong) match
+    for any title_contains derived from that same substring."""
     title_contains = title_contains.lower()
     for w in gw.getAllWindows():
-        if w.title and title_contains in w.title.lower():
+        if w.title and title_contains in w.title.lower() and _window_pid(w) != _OWN_PID:
             return w
     return None
 
@@ -80,6 +109,8 @@ def find_window_at_point(x: int, y: int, title_must_contain: str = APP_TITLE_SAF
         if w.width <= 0 or w.height <= 0:
             continue
         if title_must_contain and title_must_contain.lower() not in w.title.lower():
+            continue
+        if _window_pid(w) == _OWN_PID:
             continue
         if w.left <= x <= w.left + w.width and w.top <= y <= w.top + w.height:
             area = w.width * w.height
