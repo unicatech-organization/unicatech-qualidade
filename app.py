@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
+import keyboard
 import pyautogui
 
 import auto_detect
@@ -26,6 +27,7 @@ class App(tk.Tk):
         self.geometry("760x560")
 
         self.log_queue = queue.Queue()
+        self.hotkey_queue = queue.Queue()
         self.runner = None
         self.runner_thread = None
         self.records = []
@@ -33,7 +35,9 @@ class App(tk.Tk):
         self.is_paused = False
 
         self._build_ui()
+        self._register_hotkeys()
         self.after(150, self._drain_log_queue)
+        self.after(100, self._drain_hotkey_queue)
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -50,6 +54,14 @@ class App(tk.Tk):
         self.pause_btn.grid(row=0, column=4, padx=4)
         self.stop_btn = ttk.Button(top, text="Parar", command=self._on_stop, state="disabled")
         self.stop_btn.grid(row=0, column=5, padx=4)
+
+        schedule = ttk.Frame(self, padding=(10, 0))
+        schedule.pack(fill="x")
+        ttk.Label(schedule, text="Desligar automaticamente às (HH:MM, opcional):").pack(side="left")
+        self.stop_at_var = tk.StringVar()
+        ttk.Entry(schedule, textvariable=self.stop_at_var, width=8).pack(side="left", padx=(6, 0))
+        ttk.Label(schedule, text="  (salva o progresso e retoma do mesmo ponto depois)",
+                  foreground="gray").pack(side="left")
 
         info = ttk.Frame(self, padding=(10, 0))
         info.pack(fill="x")
@@ -70,7 +82,8 @@ class App(tk.Tk):
         self.console.pack(fill="both", expand=True)
 
         hint = ("Dica: jogue o mouse para o canto superior-esquerdo da tela a qualquer momento "
-                "para abortar imediatamente (failsafe do pyautogui).")
+                "para abortar imediatamente (failsafe do pyautogui). Atalhos: F8 pausa/retoma, "
+                "F9 para e já salva o progresso.")
         ttk.Label(self, text=hint, foreground="gray", padding=(10, 0, 10, 10)).pack(anchor="w")
 
     # ---------------- logging ----------------
@@ -154,6 +167,15 @@ class App(tk.Tk):
             messagebox.showwarning("Lista pendente", "Upe uma lista (passo 2) antes de iniciar.")
             return
 
+        stop_at_text = self.stop_at_var.get().strip()
+        stop_at_time = None
+        if stop_at_text:
+            try:
+                stop_at_time = datetime.strptime(stop_at_text, "%H:%M").time()
+            except ValueError:
+                messagebox.showwarning("Horário inválido", "Use o formato HH:MM (ex.: 20:00) ou deixe em branco.")
+                return
+
         signature = io_utils.file_signature(self.input_path)
         self.runner = automation.AutomationRunner(
             config=config,
@@ -162,7 +184,10 @@ class App(tk.Tk):
             on_progress=self._on_progress,
             on_logout=self._on_logout_detected,
             input_signature=signature,
+            stop_at_time=stop_at_time,
         )
+        if stop_at_time:
+            self.log(f"Parada automática agendada para {stop_at_time.strftime('%H:%M')}.")
 
         self.start_btn.configure(state="disabled")
         self.pause_btn.configure(state="normal", text="Pausar")
@@ -194,6 +219,33 @@ class App(tk.Tk):
         if messagebox.askyesno("Confirmar", "Parar a automação? O progresso fica salvo e você pode retomar depois."):
             self.runner.stop()
             self.stop_btn.configure(state="disabled")
+
+    # ---------------- global hotkeys ----------------
+    def _register_hotkeys(self):
+        try:
+            keyboard.add_hotkey("f8", lambda: self.hotkey_queue.put("pause"))
+            keyboard.add_hotkey("f9", lambda: self.hotkey_queue.put("stop"))
+        except Exception as exc:
+            self.log(f"Aviso: não foi possível registrar os atalhos F8/F9 ({exc}).")
+
+    def _drain_hotkey_queue(self):
+        try:
+            while True:
+                action = self.hotkey_queue.get_nowait()
+                if action == "pause":
+                    self._on_pause_resume()
+                elif action == "stop":
+                    self._hotkey_stop()
+        except queue.Empty:
+            pass
+        self.after(100, self._drain_hotkey_queue)
+
+    def _hotkey_stop(self):
+        if not self.runner:
+            return
+        self.log("Atalho F9 pressionado -- parando e salvando o progresso.")
+        self.runner.stop()
+        self.stop_btn.configure(state="disabled")
 
     def _on_logout_detected(self):
         self.pause_btn.configure(text="Retomar")

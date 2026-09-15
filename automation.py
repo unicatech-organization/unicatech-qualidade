@@ -8,6 +8,7 @@ import random
 import re
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pyautogui
@@ -53,7 +54,7 @@ OCR_RETRIES = 4
 
 class AutomationRunner:
     def __init__(self, config: dict, records, log=print, on_progress=None, on_logout=None,
-                 input_signature="default"):
+                 input_signature="default", stop_at_time=None):
         self.config = config
         pytesseract.pytesseract.tesseract_cmd = config.get(
             "tesseract_cmd", r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -66,6 +67,8 @@ class AutomationRunner:
         self.on_progress = on_progress or (lambda *a, **k: None)
         self.on_logout = on_logout or (lambda: None)
         self.input_signature = input_signature
+        self.stop_at_time = stop_at_time  # datetime.time or None -- auto-stop once reached, checkpoint stays saved
+        self._scheduled_stop_triggered = False
 
         self.results = {}  # cnpj -> status
         self.index = 0
@@ -124,6 +127,18 @@ class AutomationRunner:
     def stop(self):
         self._stop_event.set()
         self._pause_event.set()  # unblock if paused, so it can exit the loop
+
+    def _check_scheduled_stop(self):
+        """If a stop-at time was configured and it's been reached, stop the run
+        (checkpoint keeps whatever progress was already saved, so it resumes
+        from there next time)."""
+        if self.stop_at_time is None or self._stop_event.is_set():
+            return
+        if datetime.now().time() >= self.stop_at_time:
+            self._scheduled_stop_triggered = True
+            self.log(f"Horário agendado ({self.stop_at_time.strftime('%H:%M')}) atingido -- "
+                     "parando automaticamente e salvando o progresso.")
+            self.stop()
 
     # ---------- window/session helpers ----------
     def _get_window(self):
@@ -563,8 +578,10 @@ class AutomationRunner:
         self.log(f"Iniciando processamento de {total} registros (a partir do item {self.index + 1}).")
 
         while self.index < total:
+            self._check_scheduled_stop()
             if self._stop_event.is_set():
-                self.log("Parado pelo usuário.")
+                if not self._scheduled_stop_triggered:
+                    self.log("Parado pelo usuário.")
                 break
 
             self._pause_event.wait()
@@ -607,6 +624,7 @@ class AutomationRunner:
 
         self.log(f"\nReprocessando {len(error_cnpjs)} registro(s) que deram erro na primeira passada...")
         for cnpj in error_cnpjs:
+            self._check_scheduled_stop()
             if self._stop_event.is_set():
                 break
             self._pause_event.wait()
